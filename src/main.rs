@@ -1,21 +1,23 @@
 use hex_slice::AsHex;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::io::Write;
 
 use core::fmt;
 
 use bytes::Bytes;
 
-use tokio_serial::*;
 use tokio::runtime::Runtime;
 use tokio::time::{delay_for, Duration};
-use tokio::io::{AsyncWriteExt, AsyncReadExt};
-use tokio::sync::Mutex;
 
 #[macro_use]
 extern crate bitflags;
 
 use libc::c_ulong;
+use tokio::task;
+use serialport::{FlowControl, Parity, DataBits, StopBits, SerialPort};
+use std::io::Read;
+use std::thread::sleep;
 
 // constants stolen from C libs
 const TIOCSRS485: c_ulong = 0x542f;
@@ -90,86 +92,85 @@ fn set_rs485_mode(fd: RawFd)
     }
 }
 
-
 async fn process()
 {
-    let mut settings = tokio_serial::SerialPortSettings::default();
-    settings.baud_rate = 115200;
-    settings.flow_control = FlowControl::None;
-    settings.parity = Parity::None;
-    settings.data_bits = DataBits::Eight;
-    settings.stop_bits = StopBits::One;
-    settings.timeout = Duration::from_millis(1000);
-
     let port_name = "/dev/ttyO4";
 
-    let mut port = Serial::from_path(port_name, &settings).unwrap();
+    let s = serialport::new(port_name, 115200)
+        .flow_control(FlowControl::None)
+        .data_bits(DataBits::Eight)
+        .stop_bits( StopBits::One)
+        .parity(Parity::None)
+        .timeout(Duration::from_millis(1000));
+
+    let mut port = s.open_native().unwrap();
+    port.set_exclusive(true).unwrap();
+
     let fd = port.as_raw_fd();
     set_rs485_mode(fd);
 
-    port.set_exclusive(true).unwrap();
+    println!("Timeout: {:?}", port.timeout());
+    delay_for(Duration::from_millis(1000)).await;
 
-    let port_mutex  = Arc::new(Mutex::new(port));
+    let port_mutex = Arc::new(Mutex::new(port));
+
+    let mb_request: Vec<u8> = vec![0x01, 0x03, 0x00, 0x00, 0x00, 0x0A, 0xC5, 0xCD];
+
+    let req_regs_cnt = mb_request[5];
+    let response_bytes_cnt = ((req_regs_cnt*2) + 5) as usize;
 
     loop
     {
-        let old = chrono::Local::now();
-
-        let mut serial_data = [0 as u8; 255];
-
-        let mb_request: Vec<u8> = vec![0x01, 0x03, 0x00, 0x00, 0x00, 0x0A, 0xC5, 0xCD];
-
-        let mut spt = port_mutex.lock().await;
+        let req = mb_request.clone();
+        let port_mutex_cloned = port_mutex.clone();
         {
-            let r = spt.write(mb_request.as_slice()).await;
-            match r
-            {
-                Ok(_size) => {
-                    unsafe {
-                        REQS = REQS + 1;
-                        println!("Write bytes : {:02X}, Reqs: {}", mb_request.as_hex(), REQS);
-                    }
-                },
-                Err(e) => {
-                    println!("Error. Failed write. Error: {}", e);
-                }
-            }
+            task::spawn_blocking(move || {
+                let old = chrono::Local::now();
 
-            delay_for(Duration::from_millis(1)).await;
-
-            let r = spt.read(&mut serial_data).await;
-            match r
-            {
-                Ok(size) => {
-                    if size == 0 { return; }
-                    unsafe {
-                        let serial_data_vec = serial_data[..size].to_vec();
-                        if !check_crc(&Bytes::from(serial_data_vec.clone()))
-                        {
-                            ERRORS = ERRORS + 1;
-                            println!("CRC ERROR!");
+                let mut port = port_mutex_cloned.lock().unwrap();
+                match port.write(&req.as_slice())
+                {
+                    Ok(_size) => {
+                        unsafe {
+                            REQS = REQS + 1;
+                            println!("Write bytes : {:02X}, Reqs: {}", req.as_hex(), REQS);
                         }
-                        println!("Readed bytes : {:02X} Errors: {}, Timeouts: {}", serial_data[..size].as_hex(), ERRORS, TIMEOUTS);
-                    }
-                },
-                Err(e) => {
-                    unsafe {
-                        if e.kind() == std::io::ErrorKind::TimedOut
-                        {
-                            TIMEOUTS = TIMEOUTS + 1;
-                        } else {
-                            ERRORS = ERRORS + 1;
+                    },
+                    Err(e) => { println!("Error. Failed write. Error: {}", e); }
+                };
+
+                let mut buf = vec![0; response_bytes_cnt as usize];
+                sleep(Duration::from_micros(300));
+
+                match port.read_exact(&mut buf)
+                {
+                    Ok(()) => {
+                        let serial_data_vec = buf.to_vec();
+                        let res = check_crc(&Bytes::from(serial_data_vec.clone()));
+
+                        unsafe {
+                            if !res
+                            {
+                                ERRORS = ERRORS + 1;
+                                println!("CRC ERROR!");
+                            }
+                            println!("Readed bytes : {:02X} Errors: {}, Timeouts: {}",  serial_data_vec.as_hex(), ERRORS, TIMEOUTS);
                         }
-                        println!("Error. Failed read. Error : {}, Errors: {}, Timeouts: {}", e, ERRORS, TIMEOUTS);
-                    }
-                },
-            };
+                    },
+                    Err(e) => {
+                        unsafe {
+                            if e.kind() == std::io::ErrorKind::TimedOut { TIMEOUTS = TIMEOUTS + 1; }
+                            else { ERRORS = ERRORS + 1; }
+                            println!("Error. Failed read. Error : {}, Errors: {}, Timeouts: {}", e, ERRORS, TIMEOUTS);
+                        }
+                    },
+                };
 
-            delay_for(Duration::from_millis(5)).await;
+                sleep(Duration::from_micros(300));
+                println!("Period: {} ms", (chrono::Local::now()-old).num_milliseconds());
 
-            let new = chrono::Local::now();
-            let dur = new - old;
-            println!("Period : {} us", dur.num_microseconds().unwrap());
+            }).await.unwrap();
+
         }
     }
 }
